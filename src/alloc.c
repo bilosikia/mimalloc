@@ -29,12 +29,16 @@ terms of the MIT license. A copy of the license can be found in the file
 extern inline void* _mi_page_malloc(mi_heap_t* heap, mi_page_t* page, size_t size, bool zero) mi_attr_noexcept {
   mi_assert_internal(page->xblock_size==0||mi_page_block_size(page) >= size);
   mi_block_t* const block = page->free;
+  // slow path
   if mi_unlikely(block == NULL) {
     return _mi_malloc_generic(heap, size, zero, 0);
   }
+  // fast path
   mi_assert_internal(block != NULL && _mi_ptr_page(block) == page);
   // pop from the free list
+  // 增加 block 使用计数
   page->used++;
+  // 从链表移除
   page->free = mi_block_next(page, block);
   mi_assert_internal(page->free == NULL || _mi_ptr_page(page->free) == page);
 
@@ -47,6 +51,7 @@ extern inline void* _mi_page_malloc(mi_heap_t* heap, mi_page_t* page, size_t siz
   if mi_unlikely(zero) {
     mi_assert_internal(page->xblock_size != 0); // do not call with zero'ing for huge blocks (see _mi_malloc_generic)
     const size_t zsize = (page->is_zero ? sizeof(block->next) + MI_PADDING_SIZE : page->xblock_size);
+    // 置 0
     _mi_memzero_aligned(block, zsize - MI_PADDING_SIZE);
   }
 
@@ -93,6 +98,7 @@ static inline mi_decl_restrict void* mi_heap_malloc_small_zero(mi_heap_t* heap, 
   mi_assert(heap != NULL);
   #if MI_DEBUG
   const uintptr_t tid = _mi_thread_id();
+  // thread_id 为 0 意味着什么？
   mi_assert(heap->thread_id == 0 || heap->thread_id == tid); // heaps are thread local
   #endif
   mi_assert(size <= MI_SMALL_SIZE_MAX);
@@ -101,7 +107,10 @@ static inline mi_decl_restrict void* mi_heap_malloc_small_zero(mi_heap_t* heap, 
     size = sizeof(void*);
   }
 #endif
+  // 从 heap pages_free_direct 中 获取有 size 大小的 page, 如果没有合适的 page，返回值指向一个空 page
+  // pages_free_direct 是用于加快查找有 free block 的 page
   mi_page_t* page = _mi_heap_get_free_small_page(heap, size + MI_PADDING_SIZE);
+  // 从 page 中分配, 如果 page 没有合适的 block，从 heap 中进行generic分配
   void* p = _mi_page_malloc(heap, page, size + MI_PADDING_SIZE, zero);
   mi_assert_internal(p == NULL || mi_usable_size(p) >= size);
 #if MI_STAT>1

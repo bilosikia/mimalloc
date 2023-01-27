@@ -55,6 +55,7 @@ static void mi_commit_mask_set(mi_commit_mask_t* res, const mi_commit_mask_t* cm
 static void mi_commit_mask_create(size_t bitidx, size_t bitcount, mi_commit_mask_t* cm) {
   mi_assert_internal(bitidx < MI_COMMIT_MASK_BITS);
   mi_assert_internal((bitidx + bitcount) <= MI_COMMIT_MASK_BITS);
+  // 加快更新 cm 掩码的速度
   if (bitcount == MI_COMMIT_MASK_BITS) {
     mi_assert_internal(bitidx==0);
     mi_commit_mask_create_full(cm);
@@ -64,12 +65,19 @@ static void mi_commit_mask_create(size_t bitidx, size_t bitcount, mi_commit_mask
   }
   else {
     mi_commit_mask_create_empty(cm);
+    // 下标
     size_t i = bitidx / MI_COMMIT_MASK_FIELD_BITS;
+    // 需要部分更新的 bits(面前部分)
     size_t ofs = bitidx % MI_COMMIT_MASK_FIELD_BITS;
+    // 先更新 ofs 的部分
     while (bitcount > 0) {
       mi_assert_internal(i < MI_COMMIT_MASK_FIELD_COUNT);
       size_t avail = MI_COMMIT_MASK_FIELD_BITS - ofs;
       size_t count = (bitcount > avail ? avail : bitcount);
+      // 如果需要更新 bit 个数还有大于 MI_COMMIT_MASK_FIELD_BITS 的，更新整个 MI_COMMIT_MASK_FIELD_BITS
+      // 如果没法整个更新 MI_COMMIT_MASK_FIELD_BITS, 进行部分更新
+      size_t ss = ((size_t)1 << count) - 1;
+      size_t s = ss << ofs ;
       size_t mask = (count >= MI_COMMIT_MASK_FIELD_BITS ? ~((size_t)0) : (((size_t)1 << count) - 1) << ofs);
       cm->mask[i] = mask;
       bitcount -= count;
@@ -414,15 +422,21 @@ static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative, uin
   mi_assert_internal(segment->kind != MI_SEGMENT_HUGE);
   mi_commit_mask_create_empty(cm);
   if (size == 0 || size > MI_SEGMENT_SIZE || segment->kind == MI_SEGMENT_HUGE) return;
+  // meta 数据 slices 所占大小
   const size_t segstart = mi_segment_info_size(segment);
+  // 整个 segment slices 所有大小
   const size_t segsize = mi_segment_size(segment);
   if (p >= (uint8_t*)segment + segsize) return;
 
+  // 相对于 segment 开头的偏移
   size_t pstart = (p - (uint8_t*)segment);
   mi_assert_internal(pstart + size <= segsize);
 
   size_t start;
   size_t end;
+  // 计算需要更新 mask 的实际范围
+  // 如果是比较保守的更改 commit mask 的方式，
+  // 只会更新 [pstart,pstart + size] 内部 MI_COMMIT_SIZE 块的区域, 缩小了范围
   if (conservative) {
     // decommit conservative
     start = _mi_align_up(pstart, MI_COMMIT_SIZE);
@@ -430,11 +444,12 @@ static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative, uin
     mi_assert_internal(start >= segstart);
     mi_assert_internal(end <= segsize);
   }
-  else {
+  else { // 还会更新 pstart 和 pstart + size 所在的 MI_MINIMAL_COMMIT_SIZE 块的区域, 扩大了范围
     // commit liberal
     start = _mi_align_down(pstart, MI_MINIMAL_COMMIT_SIZE);
     end   = _mi_align_up(pstart + size, MI_MINIMAL_COMMIT_SIZE);
   }
+  // 确保不会更新 meta slices 的 commit mask
   if (pstart >= segstart && start < segstart) {  // note: the mask is also calculated for an initial commit of the info area
     start = segstart;
   }
@@ -442,12 +457,15 @@ static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative, uin
     end = segsize;
   }
 
+  // decommit 时，start 有可能大于 pstart?
   mi_assert_internal(start <= pstart && (pstart + size) <= end);
+  // 在 MI_COMMIT_SIZE 边界上
   mi_assert_internal(start % MI_COMMIT_SIZE==0 && end % MI_COMMIT_SIZE == 0);
   *start_p   = (uint8_t*)segment + start;
   *full_size = (end > start ? end - start : 0);
   if (*full_size == 0) return;
 
+  // 下标
   size_t bitidx = start / MI_COMMIT_SIZE;
   mi_assert_internal(bitidx < MI_COMMIT_MASK_BITS);
   
@@ -460,16 +478,19 @@ static void mi_segment_commit_mask(mi_segment_t* segment, bool conservative, uin
 }
 
 
-static bool mi_segment_commitx(mi_segment_t* segment, bool commit, uint8_t* p, size_t size, mi_stats_t* stats) {    
+static bool mi_segment_commitx(mi_segment_t* segment, bool commit, uint8_t* p, size_t size, mi_stats_t* stats) {
+  // 确保需要delay decommit 的之前都是 commited 状态
   mi_assert_internal(mi_commit_mask_all_set(&segment->commit_mask, &segment->decommit_mask));
 
   // commit liberal, but decommit conservative
   uint8_t* start = NULL;
   size_t   full_size = 0;
   mi_commit_mask_t mask;
+  // 计算得到需要更新的 mask
   mi_segment_commit_mask(segment, !commit/*conservative*/, p, size, &start, &full_size, &mask);
   if (mi_commit_mask_is_empty(&mask) || full_size==0) return true;
 
+  // 判断是 commit && 需要更新 mask
   if (commit && !mi_commit_mask_all_set(&segment->commit_mask, &mask)) {
     bool is_zero = false;
     mi_commit_mask_t cmask;
@@ -478,6 +499,7 @@ static bool mi_segment_commitx(mi_segment_t* segment, bool commit, uint8_t* p, s
     if (!_mi_os_commit(start,full_size,&is_zero,stats)) return false;    
     mi_commit_mask_set(&segment->commit_mask, &mask);     
   }
+  // 判断是 decommit && 有 bit 还是 commited 状态
   else if (!commit && mi_commit_mask_any_set(&segment->commit_mask, &mask)) {
     mi_assert_internal((void*)start != (void*)segment);
     //mi_assert_internal(mi_commit_mask_all_set(&segment->commit_mask, &mask));
@@ -487,9 +509,11 @@ static bool mi_segment_commitx(mi_segment_t* segment, bool commit, uint8_t* p, s
     _mi_stat_increase(&_mi_stats_main.committed, full_size - _mi_commit_mask_committed_size(&cmask, MI_SEGMENT_SIZE)); // adjust for overlap
     if (segment->allow_decommit) { 
       _mi_os_decommit(start, full_size, stats); // ok if this fails
-    } 
+    }
+    // 清除 commit 状态
     mi_commit_mask_clear(&segment->commit_mask, &mask);
   }
+  // decommit_mask 中，属于 mask 的部分已经得标记为 decommit 的了，但剩下部分还需要 delay decommit
   // increase expiration of reusing part of the delayed decommit
   if (commit && mi_commit_mask_any_set(&segment->decommit_mask, &mask)) {
     segment->decommit_expire = _mi_clock_now() + mi_option_get(mi_option_decommit_delay);
@@ -502,6 +526,7 @@ static bool mi_segment_commitx(mi_segment_t* segment, bool commit, uint8_t* p, s
 static bool mi_segment_ensure_committed(mi_segment_t* segment, uint8_t* p, size_t size, mi_stats_t* stats) {
   mi_assert_internal(mi_commit_mask_all_set(&segment->commit_mask, &segment->decommit_mask));
   // note: assumes commit_mask is always full for huge segments as otherwise the commit mask bits can overflow
+  // 需要判断是否有 delay decommit 的
   if (mi_commit_mask_is_full(&segment->commit_mask) && mi_commit_mask_is_empty(&segment->decommit_mask)) return true; // fully committed
   return mi_segment_commitx(segment,true,p,size,stats);
 }
@@ -511,20 +536,25 @@ static void mi_segment_perhaps_decommit(mi_segment_t* segment, uint8_t* p, size_
   if (mi_option_get(mi_option_decommit_delay) == 0) {
     mi_segment_commitx(segment, false, p, size, stats);
   }
-  else {
+  else { // delay decommit
     // register for future decommit in the decommit mask
     uint8_t* start = NULL;
     size_t   full_size = 0;
-    mi_commit_mask_t mask; 
+    mi_commit_mask_t mask;
+    // 得到 [p, p+size] 范围内需要更新的 mask
     mi_segment_commit_mask(segment, true /*conservative*/, p, size, &start, &full_size, &mask);
     if (mi_commit_mask_is_empty(&mask) || full_size==0) return;
     
     // update delayed commit
+    // 确保不变式
     mi_assert_internal(segment->decommit_expire > 0 || mi_commit_mask_is_empty(&segment->decommit_mask));      
     mi_commit_mask_t cmask;
+    // 只更新已经是 commited 的 mask
     mi_commit_mask_create_intersect(&segment->commit_mask, &mask, &cmask);  // only decommit what is committed; span_free may try to decommit more
+    // 设置需要 delay decommit 的 mask
     mi_commit_mask_set(&segment->decommit_mask, &cmask);
-    mi_msecs_t now = _mi_clock_now();    
+    mi_msecs_t now = _mi_clock_now();
+    // 过期时间的策略
     if (segment->decommit_expire == 0) {
       // no previous decommits, initialize now
       segment->decommit_expire = now + mi_option_get(mi_option_decommit_delay);
@@ -548,14 +578,17 @@ static void mi_segment_perhaps_decommit(mi_segment_t* segment, uint8_t* p, size_
 static void mi_segment_delayed_decommit(mi_segment_t* segment, bool force, mi_stats_t* stats) {
   if (!segment->allow_decommit || mi_commit_mask_is_empty(&segment->decommit_mask)) return;
   mi_msecs_t now = _mi_clock_now();
+  // 如果还没有到期，直接返回
   if (!force && now < segment->decommit_expire) return;
 
   mi_commit_mask_t mask = segment->decommit_mask;
   segment->decommit_expire = 0;
+  // 清空 decommit_mask
   mi_commit_mask_create_empty(&segment->decommit_mask);
 
   size_t idx;
   size_t count;
+  // 进行实际的 decommit
   mi_commit_mask_foreach(&mask, idx, count) {
     // if found, decommit that sequence
     if (count > 0) {
@@ -577,9 +610,11 @@ static bool mi_segment_is_abandoned(mi_segment_t* segment) {
   return (segment->thread_id == 0);
 }
 
+// 按照 span 维度进行 decommit
 // note: can be called on abandoned segments
 static void mi_segment_span_free(mi_segment_t* segment, size_t slice_index, size_t slice_count, bool allow_decommit, mi_segments_tld_t* tld) {
   mi_assert_internal(slice_index < segment->slice_entries);
+  // huge segment 和 已经终止的线程的 segment，不会重新加入 span queue
   mi_span_queue_t* sq = (segment->kind == MI_SEGMENT_HUGE || mi_segment_is_abandoned(segment) 
                           ? NULL : mi_span_queue_for(slice_count,tld));
   if (slice_count==0) slice_count = 1;
@@ -639,6 +674,7 @@ static mi_slice_t* mi_segment_span_free_coalesce(mi_slice_t* slice, mi_segments_
     return slice;
   }
 
+  // 进行前后合并
   // otherwise coalesce the span and add to the free span queues
   size_t slice_count = slice->slice_count;
   mi_slice_t* next = slice + slice->slice_count;
@@ -1215,19 +1251,25 @@ static mi_segment_t* mi_abandoned_pop(void) {
 ----------------------------------------------------------- */
 
 static void mi_segment_abandon(mi_segment_t* segment, mi_segments_tld_t* tld) {
+  // 所有 page 都是 abandoned
   mi_assert_internal(segment->used == segment->abandoned);
+  // 有效的 page 个数不为 0，page 被 free 时，used 会减一
   mi_assert_internal(segment->used > 0);
+  // 之前不是 abandoned
   mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_segment_t, &segment->abandoned_next) == NULL);
   mi_assert_internal(segment->abandoned_visits == 0);
   mi_assert_expensive(mi_segment_is_valid(segment,tld));
   
   // remove the free pages from the free page queues
   mi_slice_t* slice = &segment->slices[0];
+  // 最后一个有效 slice
   const mi_slice_t* end = mi_segment_slices_end(segment);
   while (slice < end) {
+    // 都是 page
     mi_assert_internal(slice->slice_count > 0);
     mi_assert_internal(slice->slice_offset == 0);
     if (slice->xblock_size == 0) { // a free page
+      // 从 tld 的 span 队列移除
       mi_segment_span_remove_from_queue(slice,tld);
       slice->xblock_size = 0; // but keep it free
     }
@@ -1235,6 +1277,7 @@ static void mi_segment_abandon(mi_segment_t* segment, mi_segments_tld_t* tld) {
   }
 
   // perform delayed decommits
+  // 不一定所有 delayed block 都是 decommited
   mi_segment_delayed_decommit(segment, mi_option_is_enabled(mi_option_abandoned_page_decommit) /* force? */, tld->stats);    
   
   // all pages in the segment are abandoned; add it to the abandoned list
@@ -1243,6 +1286,7 @@ static void mi_segment_abandon(mi_segment_t* segment, mi_segments_tld_t* tld) {
   segment->thread_id = 0;
   mi_atomic_store_ptr_release(mi_segment_t, &segment->abandoned_next, NULL);
   segment->abandoned_visits = 1;   // from 0 to 1 to signify it is abandoned
+  // 加入全局的 abandoned 链表
   mi_abandoned_push(segment);
 }
 

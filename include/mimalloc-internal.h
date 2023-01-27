@@ -295,7 +295,9 @@ static inline bool mi_mem_is_zero(void* p, size_t size) {
 // Align a byte size to a size in _machine words_,
 // i.e. byte size == `wsize*sizeof(void*)`.
 static inline size_t _mi_wsize_from_size(size_t size) {
+  // 至少要分配一个指针大小
   mi_assert_internal(size <= SIZE_MAX - sizeof(uintptr_t));
+  // 把 size 转换为 word size, 指针的大小即为 word
   return (size + sizeof(uintptr_t) - 1) / sizeof(uintptr_t);
 }
 
@@ -449,8 +451,10 @@ static inline uintptr_t _mi_ptr_cookie(const void* p) {
 
 static inline mi_page_t* _mi_heap_get_free_small_page(mi_heap_t* heap, size_t size) {
   mi_assert_internal(size <= (MI_SMALL_SIZE_MAX + MI_PADDING_SIZE));
+  // 计算 small size 换成 word 后的下标
   const size_t idx = _mi_wsize_from_size(size);
   mi_assert_internal(idx < MI_PAGES_DIRECT);
+  // 取回有 free blocks 的 page，有可能为空
   return heap->pages_free_direct[idx];
 }
 

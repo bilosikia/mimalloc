@@ -791,6 +791,7 @@ static _Atomic(void*) deferred_arg; // = NULL
 void _mi_deferred_free(mi_heap_t* heap, bool force) {
   heap->tld->heartbeat++;
   if (deferred_free != NULL && !heap->tld->recurse) {
+    // 避免重入
     heap->tld->recurse = true;
     deferred_free(force, heap->tld->heartbeat, mi_atomic_load_ptr_relaxed(void,&deferred_arg));
     heap->tld->recurse = false;
@@ -890,6 +891,7 @@ void* _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_al
   }
   mi_assert_internal(mi_heap_is_initialized(heap));
 
+  // 执行使用方注册的 deferred free
   // call potential deferred free routines
   _mi_deferred_free(heap, false);
 
@@ -899,10 +901,12 @@ void* _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_al
   // find (or allocate) a page of the right size
   mi_page_t* page = mi_find_page(heap, size, huge_alignment);
   if mi_unlikely(page == NULL) { // first time out of memory, try to collect and retry the allocation once more
+    // 如果没有合适的 page，进行一次 collect
     mi_heap_collect(heap, true /* force */);
     page = mi_find_page(heap, size, huge_alignment);
   }
 
+  // 如果没有合适的 page，返回
   if mi_unlikely(page == NULL) { // out of memory
     const size_t req_size = size - MI_PADDING_SIZE;  // correct for padding_size in case of an overflow on `size`
     _mi_error_message(ENOMEM, "unable to allocate memory (%zu bytes)\n", req_size);
@@ -912,11 +916,13 @@ void* _mi_malloc_generic(mi_heap_t* heap, size_t size, bool zero, size_t huge_al
   mi_assert_internal(mi_page_immediate_available(page));
   mi_assert_internal(mi_page_block_size(page) >= size);
 
+  // 因为都是在本线程 heap 中 page，所以 page 已经是有效的
   // and try again, this time succeeding! (i.e. this should never recurse through _mi_page_malloc)
   if mi_unlikely(zero && page->xblock_size == 0) {
     // note: we cannot call _mi_page_malloc with zeroing for huge blocks; we zero it afterwards in that case.
     void* p = _mi_page_malloc(heap, page, size, false);
     mi_assert_internal(p != NULL);
+    // huge block 需要再分配后进行置 0
     _mi_memzero_aligned(p, mi_page_usable_block_size(page));
     return p;
   }
